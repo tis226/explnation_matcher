@@ -533,18 +533,126 @@ def extract_explanation_text(
 
     option_squeezed = [squeeze(text) for text in option_texts if text]
     option_alnum = [alnum_only(text) for text in option_texts if text]
-    lines: List[str] = []
-    for block in blocks:
-        lines.extend(block.text.splitlines())
+    per_page_blocks: Dict[int, List[Tuple[int, Block]]] = defaultdict(list)
+    for local_idx, block in enumerate(blocks):
+        per_page_blocks[block.page_index].append((local_idx, block))
 
-    in_explanation = not option_symbols
-    encountered: set[str] = set()
-    explanation_lines: List[str] = []
-    all_symbols = set(option_symbols)
+    table_block_indices: set[int] = set()
+    for page_index, page_blocks in per_page_blocks.items():
+        candidate_starts: List[float] = []
+        flagged: set[int] = set()
+        for i, (idx_a, block_a) in enumerate(page_blocks):
+            rect_a = block_a.bbox
+            for idx_b, block_b in page_blocks[i + 1 :]:
+                rect_b = block_b.bbox
+                overlap = min(rect_a.y1, rect_b.y1) - max(rect_a.y0, rect_b.y0)
+                if overlap <= 0:
+                    continue
+                height_a = rect_a.y1 - rect_a.y0
+                height_b = rect_b.y1 - rect_b.y0
+                min_height = min(height_a, height_b)
+                if min_height <= 0:
+                    continue
+                if overlap / min_height < 0.35:
+                    continue
+                if rect_a.x1 <= rect_b.x0:
+                    gap = rect_b.x0 - rect_a.x1
+                elif rect_b.x1 <= rect_a.x0:
+                    gap = rect_a.x0 - rect_b.x1
+                else:
+                    continue
+                if gap < 4.0:
+                    continue
+                flagged.update({idx_a, idx_b})
+                candidate_starts.append(min(rect_a.y0, rect_b.y0))
+        if candidate_starts and len(flagged) >= 2:
+            threshold = max(min(candidate_starts) - 35.0, 0.0)
+            for idx, block in page_blocks:
+                if idx in flagged or block.bbox.y0 >= threshold:
+                    table_block_indices.add(idx)
+
+    normalized_page_counts = getattr(index, "_normalized_page_counts", None)
+    if normalized_page_counts is None:
+        page_sets: Dict[str, set[int]] = defaultdict(set)
+        for block in index.blocks:
+            if block.normalized:
+                page_sets[block.normalized].add(block.page_index)
+        normalized_page_counts = {
+            key: len(pages) for key, pages in page_sets.items() if pages
+        }
+        setattr(index, "_normalized_page_counts", normalized_page_counts)
+
+    lines: List[Tuple[str, int]] = []
+    for local_idx, block in enumerate(blocks):
+        for raw_line in block.text.splitlines():
+            lines.append((raw_line, local_idx))
+
     skip_texts = [text for text in (skip_texts or []) if text]
     skip_set = {text.strip() for text in skip_texts if text.strip()}
+    skip_values = tuple(skip_set)
     skip_squeezed = [squeeze(text) for text in skip_texts if text]
     skip_alnum = [alnum_only(text) for text in skip_texts if text]
+
+    line_infos: List[Tuple[str, str, str, int, int, int]] = []
+    squeezed_parts: List[str] = []
+    cursor = 0
+    for raw_line, block_idx in lines:
+        squeezed_line = squeeze(raw_line)
+        alnum_line = alnum_only(raw_line)
+        start = cursor
+        cursor += len(squeezed_line)
+        line_infos.append(
+            (raw_line, squeezed_line, alnum_line, start, cursor, block_idx)
+        )
+        squeezed_parts.append(squeezed_line)
+
+    squeezed_total = "".join(squeezed_parts)
+
+    def slice_after_squeezed(raw_line: str, squeezed_count: int) -> str:
+        if squeezed_count <= 0:
+            return raw_line
+        consumed = 0
+        for idx, ch in enumerate(raw_line):
+            if ch.isspace():
+                continue
+            consumed += 1
+            if consumed == squeezed_count:
+                return raw_line[idx + 1 :]
+        return ""
+
+    last_option_end = -1
+    search_cursor = 0
+    for candidate in option_squeezed:
+        if not candidate:
+            continue
+        hit = squeezed_total.find(candidate, search_cursor)
+        if hit == -1:
+            continue
+        end = hit + len(candidate)
+        last_option_end = max(last_option_end, end)
+        search_cursor = end
+
+    start_line_idx = 0
+    remainder_line: Optional[Tuple[str, int]] = None
+    if last_option_end >= 0 and line_infos:
+        for idx, info in enumerate(line_infos):
+            raw_line, squeezed_line, _alnum_line, start, end, block_idx = info
+            if last_option_end <= start:
+                start_line_idx = idx
+                break
+            if last_option_end <= end:
+                offset = last_option_end - start
+                if offset < len(squeezed_line):
+                    remainder_line = (
+                        slice_after_squeezed(raw_line, offset),
+                        block_idx,
+                    )
+                start_line_idx = idx + 1
+                break
+        else:
+            start_line_idx = len(line_infos)
+
+    explanation_lines: List[str] = []
     candidate_pairs: List[Tuple[str, str]] = []
     seen_candidates: set[Tuple[str, str]] = set()
     for pair in zip(option_squeezed, option_alnum):
@@ -558,109 +666,181 @@ def extract_explanation_text(
 
     pending_remainders: List[Tuple[str, str]] = []
 
-    for line in lines:
-        stripped = line.strip()
-        if not in_explanation:
-            line_hits = [sym for sym in option_symbols if sym and sym in stripped]
-            if line_hits:
-                encountered.update(line_hits)
-                if all_symbols.issubset(encountered):
-                    in_explanation = True
-                continue
-        if in_explanation:
-            squeezed = squeeze(stripped)
-            alnum = alnum_only(stripped)
-            pending_matched = False
-            updated_pending: List[Tuple[str, str]] = []
-            for remaining_sq, remaining_al in pending_remainders:
-                if squeezed and remaining_sq.startswith(squeezed):
-                    new_sq = remaining_sq[len(squeezed) :]
-                    new_al = (
-                        remaining_al[len(alnum) :]
-                        if alnum and remaining_al.startswith(alnum)
-                        else remaining_al
-                    )
-                    if new_sq.strip() or new_al.strip():
-                        updated_pending.append((new_sq, new_al))
-                    pending_matched = True
-                elif alnum and remaining_al.startswith(alnum):
-                    new_al = remaining_al[len(alnum) :]
-                    new_sq = remaining_sq
-                    if new_sq.strip() or new_al.strip():
-                        updated_pending.append((new_sq, new_al))
-                    pending_matched = True
-                else:
-                    updated_pending.append((remaining_sq, remaining_al))
-            if pending_matched:
-                pending_remainders = updated_pending
-                continue
+    def process_line(raw_line: str, block_idx: Optional[int]) -> None:
+        nonlocal pending_remainders
+        stripped = raw_line.strip()
+        squeezed = squeeze(stripped)
+        alnum = alnum_only(stripped)
 
-            if skip_set and stripped in skip_set:
-                continue
-            skip_line = False
-            if stripped and any(entry and entry in stripped for entry in skip_set):
-                skip_line = True
-            if not skip_line and squeezed and len(squeezed) >= 5 and (
-                any(squeezed in candidate or candidate in squeezed for candidate in option_squeezed if candidate)
-                or any(squeezed in candidate or candidate in squeezed for candidate in skip_squeezed if candidate)
-            ):
-                skip_line = True
-            if not skip_line and alnum and len(alnum) >= 5 and (
-                any(alnum in candidate or candidate in alnum for candidate in option_alnum if candidate)
-                or any(alnum in candidate or candidate in alnum for candidate in skip_alnum if candidate)
-            ):
-                skip_line = True
-            if not skip_line and alnum and len(alnum) >= 6:
-                for candidate in option_alnum:
+        if block_idx is not None and block_idx in table_block_indices:
+            return
+
+        if block_idx is not None and 0 <= block_idx < len(blocks):
+            block = blocks[block_idx]
+            if normalized_page_counts.get(block.normalized, 0) >= 3:
+                return
+
+        if stripped and any(
+            stripped == symbol or stripped == f"{symbol}."
+            for symbol in option_symbols
+        ):
+            return
+
+        if stripped.startswith("◤"):
+            return
+
+        if stripped.startswith("-") and stripped.endswith("-"):
+            inner = stripped[1:-1].strip()
+            if inner.replace(" ", "").isdigit():
+                return
+
+        pending_matched = False
+        updated_pending: List[Tuple[str, str]] = []
+        for remaining_sq, remaining_al in pending_remainders:
+            if squeezed and remaining_sq.startswith(squeezed):
+                new_sq = remaining_sq[len(squeezed) :]
+                new_al = (
+                    remaining_al[len(alnum) :]
+                    if alnum and remaining_al.startswith(alnum)
+                    else remaining_al
+                )
+                if new_sq.strip() or new_al.strip():
+                    updated_pending.append((new_sq, new_al))
+                pending_matched = True
+            elif alnum and remaining_al.startswith(alnum):
+                new_al = remaining_al[len(alnum) :]
+                new_sq = remaining_sq
+                if new_sq.strip() or new_al.strip():
+                    updated_pending.append((new_sq, new_al))
+                pending_matched = True
+            else:
+                updated_pending.append((remaining_sq, remaining_al))
+        if pending_matched:
+            pending_remainders = updated_pending
+            return
+
+        if skip_set and stripped in skip_set:
+            return
+
+        def overlaps_substantially(text: str, candidates: Sequence[str]) -> bool:
+            text_len = len(text)
+            if text_len == 0:
+                return False
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                cand_len = len(candidate)
+                if text == candidate:
+                    return True
+                if text_len >= 6 and candidate.startswith(text):
+                    return True
+                if cand_len >= 6 and text.startswith(candidate):
+                    coverage = cand_len / max(text_len, 1)
+                    if coverage >= 0.6:
+                        return True
+                if text_len < 6 or cand_len < 6:
+                    continue
+                shorter = min(text_len, cand_len)
+                longer = max(text_len, cand_len)
+                if shorter / longer >= 0.6 and (
+                    text in candidate or candidate in text
+                ):
+                    return True
+            return False
+
+        skip_line = False
+        if stripped and overlaps_substantially(stripped, skip_values):
+            skip_line = True
+        if (
+            not skip_line
+            and squeezed
+            and overlaps_substantially(squeezed, option_squeezed)
+        ):
+            skip_line = True
+        if (
+            not skip_line
+            and squeezed
+            and overlaps_substantially(squeezed, skip_squeezed)
+        ):
+            skip_line = True
+        if (
+            not skip_line
+            and alnum
+            and overlaps_substantially(alnum, option_alnum)
+        ):
+            skip_line = True
+        if (
+            not skip_line
+            and alnum
+            and overlaps_substantially(alnum, skip_alnum)
+        ):
+            skip_line = True
+        if not skip_line and alnum and len(alnum) >= 6:
+            for candidate in option_alnum:
+                if not candidate:
+                    continue
+                shorter = min(len(alnum), len(candidate))
+                if shorter < 6:
+                    continue
+                longer = max(len(alnum), len(candidate))
+                if longer > shorter * 1.5:
+                    continue
+                if SequenceMatcher(None, alnum, candidate).ratio() >= 0.9:
+                    skip_line = True
+                    break
+            if not skip_line:
+                for candidate in skip_alnum:
                     if not candidate:
                         continue
                     shorter = min(len(alnum), len(candidate))
                     if shorter < 6:
                         continue
+                    longer = max(len(alnum), len(candidate))
+                    if longer > shorter * 1.5:
+                        continue
                     if SequenceMatcher(None, alnum, candidate).ratio() >= 0.9:
                         skip_line = True
                         break
-                if not skip_line:
-                    for candidate in skip_alnum:
-                        if not candidate:
-                            continue
-                        shorter = min(len(alnum), len(candidate))
-                        if shorter < 6:
-                            continue
-                        if SequenceMatcher(None, alnum, candidate).ratio() >= 0.9:
-                            skip_line = True
-                            break
-            if skip_line:
-                for cand_sq, cand_al in candidate_pairs:
-                    if not cand_sq and not cand_al:
-                        continue
-                    remainder_sq = ""
-                    remainder_al = ""
-                    matched = False
-                    if squeezed and cand_sq and cand_sq.startswith(squeezed):
-                        remainder_sq = cand_sq[len(squeezed) :]
-                        if cand_al and alnum and cand_al.startswith(alnum):
-                            remainder_al = cand_al[len(alnum) :]
-                        else:
-                            remainder_al = cand_al or ""
-                        matched = True
-                    elif alnum and cand_al and cand_al.startswith(alnum):
+        if skip_line:
+            for cand_sq, cand_al in candidate_pairs:
+                if not cand_sq and not cand_al:
+                    continue
+                remainder_sq = ""
+                remainder_al = ""
+                matched = False
+                if squeezed and cand_sq and cand_sq.startswith(squeezed):
+                    remainder_sq = cand_sq[len(squeezed) :]
+                    if cand_al and alnum and cand_al.startswith(alnum):
                         remainder_al = cand_al[len(alnum) :]
-                        if cand_sq and squeezed and cand_sq.startswith(squeezed):
-                            remainder_sq = cand_sq[len(squeezed) :]
-                        else:
-                            remainder_sq = cand_sq or ""
-                        matched = True
-                    elif squeezed and cand_sq and squeezed.endswith(cand_sq):
-                        matched = True
-                    elif alnum and cand_al and alnum.endswith(cand_al):
-                        matched = True
-                    if matched:
-                        if remainder_sq.strip() or remainder_al.strip():
-                            pending_remainders.append((remainder_sq, remainder_al))
-                        break
-                continue
-            explanation_lines.append(line.rstrip())
+                    else:
+                        remainder_al = cand_al or ""
+                    matched = True
+                elif alnum and cand_al and cand_al.startswith(alnum):
+                    remainder_al = cand_al[len(alnum) :]
+                    if cand_sq and squeezed and cand_sq.startswith(squeezed):
+                        remainder_sq = cand_sq[len(squeezed) :]
+                    else:
+                        remainder_sq = cand_sq or ""
+                    matched = True
+                elif squeezed and cand_sq and squeezed.endswith(cand_sq):
+                    matched = True
+                elif alnum and cand_al and alnum.endswith(cand_al):
+                    matched = True
+                if matched:
+                    if remainder_sq.strip() or remainder_al.strip():
+                        pending_remainders.append((remainder_sq, remainder_al))
+                    break
+            return
+
+        explanation_lines.append(raw_line.rstrip())
+
+    if remainder_line and remainder_line[0].strip():
+        process_line(remainder_line[0], remainder_line[1])
+
+    for raw_line, _squeezed, _alnum, _start, _end, block_idx in line_infos[
+        start_line_idx:
+    ]:
+        process_line(raw_line, block_idx)
 
     while explanation_lines and not explanation_lines[0].strip():
         explanation_lines.pop(0)
@@ -1734,3 +1914,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
