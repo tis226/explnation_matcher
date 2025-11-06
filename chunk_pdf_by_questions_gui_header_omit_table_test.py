@@ -589,6 +589,7 @@ def extract_explanation_text(
 
     skip_texts = [text for text in (skip_texts or []) if text]
     skip_set = {text.strip() for text in skip_texts if text.strip()}
+    skip_values = tuple(skip_set)
     skip_squeezed = [squeeze(text) for text in skip_texts if text]
     skip_alnum = [alnum_only(text) for text in skip_texts if text]
 
@@ -720,17 +721,58 @@ def extract_explanation_text(
 
         if skip_set and stripped in skip_set:
             return
+
+        def overlaps_substantially(text: str, candidates: Sequence[str]) -> bool:
+            text_len = len(text)
+            if text_len == 0:
+                return False
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                cand_len = len(candidate)
+                if text == candidate:
+                    return True
+                if text_len >= 6 and candidate.startswith(text):
+                    return True
+                if cand_len >= 6 and text.startswith(candidate):
+                    coverage = cand_len / max(text_len, 1)
+                    if coverage >= 0.6:
+                        return True
+                if text_len < 6 or cand_len < 6:
+                    continue
+                shorter = min(text_len, cand_len)
+                longer = max(text_len, cand_len)
+                if shorter / longer >= 0.6 and (
+                    text in candidate or candidate in text
+                ):
+                    return True
+            return False
+
         skip_line = False
-        if stripped and any(entry and entry in stripped for entry in skip_set):
+        if stripped and overlaps_substantially(stripped, skip_values):
             skip_line = True
-        if not skip_line and squeezed and len(squeezed) >= 5 and (
-            any(squeezed in candidate or candidate in squeezed for candidate in option_squeezed if candidate)
-            or any(squeezed in candidate or candidate in squeezed for candidate in skip_squeezed if candidate)
+        if (
+            not skip_line
+            and squeezed
+            and overlaps_substantially(squeezed, option_squeezed)
         ):
             skip_line = True
-        if not skip_line and alnum and len(alnum) >= 5 and (
-            any(alnum in candidate or candidate in alnum for candidate in option_alnum if candidate)
-            or any(alnum in candidate or candidate in alnum for candidate in skip_alnum if candidate)
+        if (
+            not skip_line
+            and squeezed
+            and overlaps_substantially(squeezed, skip_squeezed)
+        ):
+            skip_line = True
+        if (
+            not skip_line
+            and alnum
+            and overlaps_substantially(alnum, option_alnum)
+        ):
+            skip_line = True
+        if (
+            not skip_line
+            and alnum
+            and overlaps_substantially(alnum, skip_alnum)
         ):
             skip_line = True
         if not skip_line and alnum and len(alnum) >= 6:
@@ -739,6 +781,9 @@ def extract_explanation_text(
                     continue
                 shorter = min(len(alnum), len(candidate))
                 if shorter < 6:
+                    continue
+                longer = max(len(alnum), len(candidate))
+                if longer > shorter * 1.5:
                     continue
                 if SequenceMatcher(None, alnum, candidate).ratio() >= 0.9:
                     skip_line = True
@@ -749,6 +794,9 @@ def extract_explanation_text(
                         continue
                     shorter = min(len(alnum), len(candidate))
                     if shorter < 6:
+                        continue
+                    longer = max(len(alnum), len(candidate))
+                    if longer > shorter * 1.5:
                         continue
                     if SequenceMatcher(None, alnum, candidate).ratio() >= 0.9:
                         skip_line = True
